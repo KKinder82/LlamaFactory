@@ -14,10 +14,6 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-import pyarrow as pa
-from pyarrow import compute as pc
-
-
 REQUIRED_FIELDS = {"instruction", "output"}
 OPTIONAL_FIELDS = {"input", "system", "history"}
 ALL_FIELDS = REQUIRED_FIELDS | OPTIONAL_FIELDS
