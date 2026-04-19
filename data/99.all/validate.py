@@ -217,120 +217,6 @@ def fix_file(path: str | Path, output_path: str | Path | None = None) -> None:
     print(f"已写入: {output_path}")
 
 
-# 期望的 PyArrow Schema（四个字段均为 utf8 字符串）
-ARROW_SCHEMA = pa.schema([
-    pa.field("instruction", pa.utf8(), nullable=False),
-    pa.field("input",       pa.utf8(), nullable=False),
-    pa.field("output",      pa.utf8(), nullable=False),
-    pa.field("system",      pa.utf8(), nullable=False),
-])
-
-
-def validate_with_arrow(path: str | Path) -> ValidationResult:
-    """使用 PyArrow 校验 JSON 训练数据文件的 Schema 与数据质量.
-
-    校验内容：
-    - 使用 PyArrow 将 JSON 加载为 Arrow Table
-    - 检查字段名是否完全匹配期望 Schema
-    - 检查每列数据类型是否为 utf8 字符串
-    - 检查必填字段（instruction / output）是否存在 null 或空字符串
-    - 输出各列的 null 数量统计
-
-    Args:
-        path: JSON 文件路径。
-
-    Returns:
-        ValidationResult 对象，包含校验结果、错误和警告列表。
-    """
-    result = ValidationResult()
-    path = Path(path)
-
-    if not path.exists():
-        result.add_error(f"文件不存在: {path}")
-        return result
-
-    # 处理 BOM
-    with open(path, "rb") as f:
-        raw_start = f.read(3)
-    encoding = "utf-8-sig" if raw_start == b"\xef\xbb\xbf" else "utf-8"
-    if encoding == "utf-8-sig":
-        result.add_warning("文件包含 UTF-8 BOM，建议使用不带 BOM 的 UTF-8 编码")
-
-    # 用标准 json 模块加载数组格式的 JSON，再转为 Arrow Table
-    try:
-        with open(path, encoding=encoding) as f:
-            data = json.load(f)
-    except json.JSONDecodeError as e:
-        result.add_error(f"JSON 解析失败: {e}")
-        return result
-
-    if not isinstance(data, list):
-        result.add_error(f"顶层结构应为列表(list)，实际为 {type(data).__name__}")
-        return result
-
-    result.total_records = len(data)
-    if result.total_records == 0:
-        result.add_warning("文件中没有任何记录")
-        return result
-
-    # 转换为 Arrow Table（自动推断 Schema）
-    try:
-        table: pa.Table = pa.Table.from_pylist(data)
-    except (pa.ArrowInvalid, pa.ArrowTypeError) as e:
-        result.add_error(f"Arrow Table 构建失败: {e}")
-        return result
-
-    actual_fields = set(table.schema.names)
-    expected_fields = set(ARROW_SCHEMA.names)
-
-    # 检查多余字段
-    extra = actual_fields - expected_fields
-    if extra:
-        result.add_error(f"存在未知字段: {sorted(extra)}")
-
-    # 检查缺失字段
-    missing = expected_fields - actual_fields
-    if missing:
-        result.add_error(f"缺少必要字段: {sorted(missing)}")
-
-    # 逐字段检查类型与空值
-    for fname in ARROW_SCHEMA.names:
-        if fname not in actual_fields:
-            continue
-
-        col: pa.ChunkedArray = table.column(fname)
-
-        # 类型检查
-        if not pa.types.is_string(col.type) and not pa.types.is_large_string(col.type):
-            result.add_error(
-                f"字段 '{fname}' 类型应为 utf8/string，实际推断为 {col.type}"
-            )
-
-        # null 数量
-        null_count = col.null_count
-        if null_count > 0:
-            if fname in REQUIRED_FIELDS:
-                result.add_error(f"必填字段 '{fname}' 含有 {null_count} 个 null 值")
-            else:
-                result.add_warning(f"字段 '{fname}' 含有 {null_count} 个 null 值")
-
-        # 必填字段空字符串检查（转为非 null 后比较）
-        if fname in REQUIRED_FIELDS and pa.types.is_string(col.type):
-            combined = col.combine_chunks() if isinstance(col, pa.ChunkedArray) else col
-            empty_mask = pc.equal(pc.utf8_trim_whitespace(combined), pa.scalar("", pa.utf8()))
-            empty_count = pc.sum(empty_mask.cast(pa.int32())).as_py() or 0
-            if empty_count > 0:
-                result.add_error(f"必填字段 '{fname}' 含有 {empty_count} 条空字符串")
-
-    # 打印 Arrow Schema 信息
-    print("[Arrow] 推断 Schema:")
-    for f in table.schema:
-        null_count = table.column(f.name).null_count
-        print(f"  {f.name}: {f.type}  (nulls={null_count}, rows={table.num_rows})")
-
-    return result
-
-
 def validate_file(path: str | Path) -> ValidationResult:
     """校验指定路径的 JSON 训练数据文件.
 
@@ -347,18 +233,16 @@ def validate_file(path: str | Path) -> ValidationResult:
         result.add_error(f"文件不存在: {path}")
         return result
 
-    # 检测 BOM
+    # 检测 BOM（强制要求无 BOM 的 UTF-8）
     with open(path, "rb") as f:
         raw = f.read(3)
     if raw[:3] == b"\xef\xbb\xbf":
-        result.add_warning("文件包含 UTF-8 BOM，建议使用不带 BOM 的 UTF-8 编码")
-        encoding = "utf-8-sig"
-    else:
-        encoding = "utf-8"
+        result.add_error("文件包含 UTF-8 BOM，必须使用不带 BOM 的 UTF-8 编码")
+        return result
 
     # 解析 JSON
     try:
-        with open(path, encoding=encoding) as f:
+        with open(path, encoding="utf-8") as f:
             data = json.load(f)
     except json.JSONDecodeError as e:
         result.add_error(f"JSON 解析失败: {e}")
@@ -411,10 +295,6 @@ def main(path_json: str | None = None, method: str = "validate", output_path: st
         load_and_display(path_json)
     elif method == "fix":
         fix_file(path_json, output_path)
-    elif method == "arrow":
-        result = validate_with_arrow(path_json)
-        print(result.summary())
-        sys.exit(0 if result.is_valid else 1)
     else:
         result = validate_file(path_json)
         print(result.summary())
@@ -423,5 +303,5 @@ def main(path_json: str | None = None, method: str = "validate", output_path: st
 
 if __name__ == "__main__":
     path_json = r"G:\02.github\LlamaFactory2\data\99.all\bori_nl_all2.json"
-    method = "arrow"
+    method = ""
     main(path_json=path_json, method=method)
