@@ -1438,6 +1438,223 @@ class MiniCPMVPlugin(BasePlugin):
             mm_inputs.update(audio_inputs)
             mm_inputs.update({"audio_bounds": audio_bounds_ls, "spk_bounds": spk_bounds_ls})
 
+
+@dataclass
+class MiniCPMV4_6Plugin(BasePlugin):
+    """Plugin for MiniCPM-V-4.6 with new transformers (NaViT vision + get_placeholder_mask API)."""
+
+    def _get_mm_inputs(
+        self,
+        images: list["ImageInput"],
+        videos: list["VideoInput"],
+        audios: list["AudioInput"],
+        processor: "MMProcessor",
+        **kwargs,
+    ) -> dict[str, "torch.Tensor"]:
+        image_processor = getattr(processor, "image_processor")
+        video_processor = getattr(processor, "video_processor", None)
+        mm_inputs = {}
+
+        if len(images) != 0:
+            # The image_processor ignores downsample_mode; target_sizes are always based on patch_size.
+            # downsample_mode only affects the token divisor in _build_v4_6_placeholder and model forward.
+            mm_inputs.update(image_processor(images, return_tensors="pt"))
+
+        if len(videos) != 0:
+            if video_processor is not None:
+                video_inputs = video_processor(videos, return_tensors="pt")
+                mm_inputs["pixel_values_videos"] = video_inputs["pixel_values_videos"]
+                mm_inputs["target_sizes_videos"] = video_inputs["target_sizes_videos"]
+            else:
+                video_inputs = image_processor(videos, return_tensors="pt")
+                mm_inputs["pixel_values_videos"] = video_inputs["pixel_values"]
+                mm_inputs["target_sizes_videos"] = video_inputs["target_sizes"]
+
+        if len(audios) != 0:
+            audio_features, audio_feature_lens, audio_phs = processor.audio_feature_extract(
+                [audios],
+                chunk_input=True,
+                sampling_rate=getattr(processor, "audio_sampling_rate", 16000),
+            )
+            audio_feature_lens = [
+                x.clone().detach() if isinstance(x, torch.Tensor) else torch.tensor(x) for x in audio_feature_lens
+            ]
+            mm_inputs.update({"audio_features": audio_features, "audio_feature_lens": audio_feature_lens})
+            if kwargs.get("ret_phs", False):
+                mm_inputs.update({"audio_phs": audio_phs})
+
+        return mm_inputs
+
+    def _build_v4_6_placeholder(
+        self,
+        image_inputs: dict[str, Any],
+        image_idx: int,
+        use_image_id: bool,
+        processor: "MMProcessor",
+    ) -> str:
+        """Build image placeholder for MiniCPM-V-4.6 using NaViT token count computation."""
+        grids = image_inputs.get("grids", [[0, 0]])
+        num_patches_per_image = image_inputs.get("num_patches_per_image", [1])
+        target_sizes = image_inputs.get("target_sizes")
+
+        downsample_mode = os.getenv("DOWNSAMPLE_MODE")
+        if downsample_mode is None:
+            image_processor = getattr(processor, "image_processor")
+            downsample_mode = getattr(image_processor, "downsample_mode", "16x")
+        token_divisor = 4 if downsample_mode == "4x" else 16
+
+        flat_index = 0
+        for idx in range(image_idx):
+            flat_index += num_patches_per_image[idx]
+        n_patches = num_patches_per_image[image_idx]
+
+        img_target_sizes = target_sizes[flat_index : flat_index + n_patches]
+        num_tokens_per_patch = img_target_sizes.prod(-1) // token_divisor
+        num_rows, num_cols = grids[image_idx]
+
+        image_start = getattr(processor, "image_start_token", "<image>")
+        image_end = getattr(processor, "image_end_token", "</image>")
+        slice_start = getattr(processor, "slice_start_token", "<slice>")
+        slice_end = getattr(processor, "slice_end_token", "</slice>")
+        image_id_start = getattr(processor, "image_id_start_token", "<image_id>")
+        image_id_end = getattr(processor, "image_id_end_token", "</image_id>")
+        image_token = (
+            getattr(processor, "image_token", None)
+            or getattr(getattr(processor, "tokenizer", None), "image_token", None)
+            or "<image>"
+        )
+
+        image_placeholder = image_start + "<|ph|>" * int(num_tokens_per_patch[0]) + image_end
+        if use_image_id:
+            image_placeholder = f"{image_id_start}{image_idx}{image_id_end}" + image_placeholder
+
+        slice_mode = getattr(processor, "slice_mode", True)
+        if slice_mode and num_rows > 0 and num_cols > 0:
+            per_slice_tokens = int(num_tokens_per_patch[1]) if len(num_tokens_per_patch) > 1 else 0
+            slice_placeholder = slice_start + "<|ph|>" * per_slice_tokens + slice_end
+            slices = [slice_placeholder * num_cols for _ in range(num_rows)]
+            image_placeholder += "\n".join(slices)
+
+        return image_placeholder.replace("<|ph|>", image_token)
+
+    @override
+    def process_messages(
+        self,
+        messages: list[dict[str, str]],
+        images: list["ImageInput"],
+        videos: list["VideoInput"],
+        audios: list["AudioInput"],
+        processor: Optional["MMProcessor"],
+    ) -> list[dict[str, str]]:
+        self._validate_input(processor, images, videos, audios)
+        self._validate_messages(messages, images, videos, audios)
+        num_image_tokens, num_video_tokens, num_audio_tokens = 0, 0, 0
+        messages = deepcopy(messages)
+        mm_inputs, audio_inputs = {}, {}
+        if len(images) != 0 and len(videos) != 0:
+            raise ValueError("MiniCPM-V model does not support input images and videos at the same time.")
+
+        use_image_id = getattr(processor, "default_use_image_id", True)
+
+        if len(videos) != 0:
+            use_image_id = False
+            mm_inputs = self._get_mm_inputs([], videos, [], processor)
+
+        for i, message in enumerate(messages):
+            content = message["content"]
+            while IMAGE_PLACEHOLDER in content:
+                content = content.replace(IMAGE_PLACEHOLDER, "{{image}}", 1)
+                num_image_tokens += 1
+
+            while VIDEO_PLACEHOLDER in content:
+                num_frames = 1
+                if "num_frames_per_video" in mm_inputs:
+                    num_frames = sum(mm_inputs["num_frames_per_video"])
+                content = content.replace(VIDEO_PLACEHOLDER, "{{image}}" * num_frames, 1)
+                num_video_tokens += 1
+
+            while AUDIO_PLACEHOLDER in content:
+                content = content.replace(AUDIO_PLACEHOLDER, "{{audio}}", 1)
+                num_audio_tokens += 1
+
+            message["content"] = content.replace("{{image}}", "(<image>./</image>)").replace(
+                "{{audio}}", "(<audio>./</audio>)"
+            )
+
+        if len(images):
+            mm_inputs = self._get_mm_inputs(images, [], [], processor)
+
+        if len(audios):
+            audio_inputs = self._get_mm_inputs([], [], audios, processor, ret_phs=True)
+
+        if self.expand_mm_tokens and mm_inputs:
+            pattern = "(<image>./</image>)"
+            idx = 0
+            for index, message in enumerate(messages):
+                text = message["content"]
+                image_tags = re.findall(pattern, text)
+                text_chunks = text.split(pattern)
+                final_text = ""
+                for i in range(len(image_tags)):
+                    image_placeholder = self._build_v4_6_placeholder(mm_inputs, idx, use_image_id, processor)
+                    final_text = final_text + text_chunks[i] + image_placeholder
+                    idx += 1
+                final_text += text_chunks[-1]
+                messages[index]["content"] = final_text
+
+        if self.expand_mm_tokens and audio_inputs:
+            pattern = "(<audio>./</audio>)"
+            idx = 0
+            for index, message in enumerate(messages):
+                text = message["content"]
+                audio_tags = re.findall(pattern, text)
+                text_chunks = text.split(pattern)
+                final_text = ""
+                for i in range(len(audio_tags)):
+                    audio_placeholder = audio_inputs["audio_phs"][0][idx]
+                    final_text = final_text + text_chunks[i] + audio_placeholder
+                    idx += 1
+                final_text += text_chunks[-1]
+                messages[index]["content"] = final_text
+
+        return messages
+
+    @override
+    def get_mm_inputs(
+        self,
+        images: list["ImageInput"],
+        videos: list["VideoInput"],
+        audios: list["AudioInput"],
+        imglens: list[int],
+        vidlens: list[int],
+        audlens: list[int],
+        batch_ids: list[list[int]],
+        processor: Optional["MMProcessor"],
+    ) -> dict[str, Union[list[int], "torch.Tensor"]]:
+        self._validate_input(processor, images, videos, audios)
+        mm_inputs = self._get_mm_inputs(images, videos, audios, processor)
+
+        # v4.6 does NOT use image_bound — the model finds image tokens via get_placeholder_mask
+        # Ensure target_sizes key name matches the model's expected input
+        if "target_sizes" not in mm_inputs and "tgt_sizes" in mm_inputs:
+            mm_inputs["target_sizes"] = mm_inputs.pop("tgt_sizes")
+
+        if "target_sizes" not in mm_inputs:
+            mm_inputs["target_sizes"] = torch.empty(0, 2, dtype=torch.int32)
+
+        if "pixel_values" not in mm_inputs:
+            mm_inputs["pixel_values"] = torch.empty(1, 3, 14, 0)
+
+        # Pass downsample_mode to model forward so it matches the placeholder divisor
+        _ds = os.getenv("DOWNSAMPLE_MODE")
+        if _ds is None:
+            _ds = getattr(getattr(processor, "image_processor", None), "downsample_mode", "16x")
+        mm_inputs["downsample_mode"] = _ds
+
+        if len(audios) > 0:
+            audio_inputs = self._get_mm_inputs([], [], audios, processor)
+            mm_inputs.update(audio_inputs)
+
         return mm_inputs
 
 
@@ -2695,6 +2912,7 @@ PLUGINS = {
     "llava_next_video": LlavaNextVideoPlugin,
     "lfm2_vl": LFMVLPlugin,
     "minicpm_v": MiniCPMVPlugin,
+    "minicpm_v_4_6": MiniCPMV4_6Plugin,
     "mllama": MllamaPlugin,
     "paligemma": PaliGemmaPlugin,
     "pixtral": PixtralPlugin,
